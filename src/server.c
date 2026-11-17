@@ -2906,6 +2906,8 @@ void initServer(void) {
     server.clients_index = raxNew();
     server.clients_to_close = listCreate();
     server.replicas = listCreate();
+    server.catchup_holds = listCreate();
+    listSetFreeMethod(server.catchup_holds, zfree);
     server.monitors = listCreate();
     server.replicas_waiting_psync = raxNew();
     server.wait_before_rdb_client_free = DEFAULT_WAIT_BEFORE_RDB_CLIENT_FREE;
@@ -6634,7 +6636,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_backlog_active:%d\r\n", server.repl_backlog != NULL,
                 "repl_backlog_size:%lld\r\n", server.repl_backlog_size,
                 "repl_backlog_first_byte_offset:%lld\r\n", server.repl_backlog ? server.repl_backlog->offset : 0,
-                "repl_backlog_histlen:%lld\r\n", server.repl_backlog ? server.repl_backlog->histlen : 0));
+                "repl_backlog_histlen:%lld\r\n", server.repl_backlog ? server.repl_backlog->histlen : 0,
+                "catchup_holds:%lu\r\n", listLength(server.catchup_holds),
+                "catchup_holds_min_offset:%lld\r\n", replHoldsMinOffset()));
     }
 
     /* CPU */

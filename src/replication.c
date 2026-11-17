@@ -130,6 +130,174 @@ int bg_unlink(const char *filename) {
     }
 }
 
+/* ------------------------- DISK CATCH-UP: HOLD TABLE ------------------------
+ *
+ * When an ONLINE replica disconnects we record a "hold": its name
+ * (ip:listening-port), the replication ID it was following and the last offset
+ * it acknowledged. While at least one hold exists, the suffix file (P2) keeps
+ * the bytes from replHoldsMinOffset() onwards after the in-memory backlog
+ * trims them. No holds means nothing needs to be spilled.
+ *
+ * A hold goes away when the replica comes back and PSYNC is decided (MEMORY
+ * or FULL), when it expires (catchup-hold-ttl), when its replication history
+ * is no longer valid, or when the suffix file no longer covers its offset. */
+
+static listNode *replHoldFind(const char *name) {
+    listIter li;
+    listNode *ln;
+
+    listRewind(server.catchup_holds, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        replHold *h = listNodeValue(ln);
+        if (!strcmp(h->name, name)) return ln;
+    }
+    return NULL;
+}
+
+/* Create a hold, or refresh the existing one with the same name. */
+void replHoldAdd(const char *name, const char *replid, long long ack_off) {
+    if (!server.catchup_holds) return;
+    listNode *ln = replHoldFind(name);
+    replHold *h = ln ? listNodeValue(ln) : zmalloc(sizeof(*h));
+
+    valkey_strlcpy(h->name, name, sizeof(h->name));
+    valkey_strlcpy(h->replid, replid, sizeof(h->replid));
+    h->ack_off = ack_off;
+    h->created = server.unixtime;
+    if (!ln) listAddNodeTail(server.catchup_holds, h);
+}
+
+/* Called by freeClient() for every client being freed. Remember an ONLINE
+ * replica that is going away. It must run while the connection is still open
+ * (unlinkClient() closes it, and the replica's IP comes from the socket) and
+ * before freeClientReplicationData() releases the replica's backlog blocks,
+ * which may trim them right away. Skip MONITOR clients, replicas still in a
+ * full sync, rdb-only clients, and replicas that never ACKed or never told us
+ * their listening port (we could not match them on reconnect). */
+void replHoldOnReplicaDisconnect(client *c) {
+    if (!c->repl_data || !c->flag.replica || c->flag.monitor || c->flag.repl_rdbonly) return;
+    if (c->repl_data->repl_state != REPLICA_STATE_ONLINE) return;
+    if (c->repl_data->repl_ack_off <= 0 || c->repl_data->replica_listening_port == 0) return;
+    replHoldAdd(replicationGetReplicaName(c), server.replid, c->repl_data->repl_ack_off);
+}
+
+void replHoldRemove(const char *name) {
+    if (!server.catchup_holds) return;
+    listNode *ln = replHoldFind(name);
+    if (ln) listDelNode(server.catchup_holds, ln);
+}
+
+/* A hold is only useful if a PSYNC from that replica could still pass the
+ * history check in primaryTryPartialResynchronization(): same rule, using the
+ * first offset the replica will ask for (ack_off + 1). */
+int replHoldIsValid(const replHold *h) {
+    if (!strcasecmp(h->replid, server.replid)) return 1;
+    return !strcasecmp(h->replid, server.replid2) && h->ack_off + 1 <= server.second_replid_offset;
+}
+
+/* Drop holds whose history is no longer valid and holds older than
+ * catchup-hold-ttl (0 means holds never expire). */
+void replHoldsPrune(void) {
+    if (!server.catchup_holds) return;
+    listIter li;
+    listNode *ln;
+
+    listRewind(server.catchup_holds, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        replHold *h = listNodeValue(ln);
+        int expired = server.catchup_hold_ttl && server.unixtime - h->created > server.catchup_hold_ttl;
+        if (expired || !replHoldIsValid(h)) listDelNode(server.catchup_holds, ln);
+    }
+}
+
+void replHoldsClear(void) {
+    if (server.catchup_holds) listEmpty(server.catchup_holds);
+}
+
+/* For the suffix file (P2): the lowest offset any disconnected replica will
+ * still ask for, or -1 if there are no holds (nothing to spill). */
+long long replHoldsMinOffset(void) {
+    if (!server.catchup_holds) return -1;
+    long long min = -1;
+    listIter li;
+    listNode *ln;
+
+    listRewind(server.catchup_holds, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        replHold *h = listNodeValue(ln);
+        if (min == -1 || h->ack_off + 1 < min) min = h->ack_off + 1;
+    }
+    return min;
+}
+
+/* Called by the suffix file (P2) when it no longer holds bytes before
+ * new_base. Replicas that need older bytes can only get a FULL resync now. */
+void replHoldsSuffixBaseMoved(long long new_base) {
+    if (!server.catchup_holds) return;
+    listIter li;
+    listNode *ln;
+
+    listRewind(server.catchup_holds, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        replHold *h = listNodeValue(ln);
+        if (h->ack_off + 1 < new_base) listDelNode(server.catchup_holds, ln);
+    }
+}
+
+/* ------------------------- DISK CATCH-UP: DECIDE STEP ----------------------
+ *
+ * Pure function: given the facts about a PSYNC request, pick how to serve it.
+ * Order: history, in-memory ring, suffix file, sibling, full resync.
+ *   history_ok:  replid/offset passed the existing history check.
+ *   in_ring:     the offset is still in the in-memory backlog.
+ *   too_old:     the backlog exists and already trimmed the offset. Only this
+ *                case may use disk or a sibling. No backlog, or an offset
+ *                ahead of ours, is always FULL.
+ *   in_suffix:   the suffix file covers the offset (P2).
+ *   sibling_has: a sibling replica covers the offset (P3). */
+catchupDecision catchupDecide(int history_ok, int in_ring, int too_old, int in_suffix, int sibling_has) {
+    if (!history_ok) return CATCHUP_FULL;
+    if (in_ring) return CATCHUP_MEMORY;
+    if (!too_old) return CATCHUP_FULL;
+    if (in_suffix) return CATCHUP_DISK;
+    if (sibling_has) return CATCHUP_REDIRECT;
+    return CATCHUP_FULL;
+}
+
+const char *catchupDecisionName(catchupDecision d) {
+    switch (d) {
+    case CATCHUP_MEMORY: return "memory";
+    case CATCHUP_DISK: return "disk";
+    case CATCHUP_REDIRECT: return "redirect";
+    case CATCHUP_FULL: return "full";
+    }
+    return "unknown";
+}
+
+/* Stubs until the suffix file (P2) and sibling redirect (P3) land. They
+ * report "not available", so every PSYNC behaves exactly like stock Valkey. */
+int replSuffixHasRange(long long offset) {
+    UNUSED(offset);
+    return 0; /* P2 replaces. */
+}
+
+int replSuffixServe(client *c, long long offset) {
+    UNUSED(c);
+    UNUSED(offset);
+    return C_ERR; /* P2 replaces. */
+}
+
+int catchupSiblingHasRange(long long offset) {
+    UNUSED(offset);
+    return 0; /* P3 replaces. */
+}
+
+int catchupRedirectServe(client *c, long long offset) {
+    UNUSED(c);
+    UNUSED(offset);
+    return C_ERR; /* P3 replaces. */
+}
+
 /* ---------------------------------- PRIMARY -------------------------------- */
 
 void createReplicationBacklog(void) {
@@ -935,6 +1103,23 @@ int primaryTryPartialResynchronization(client *c, long long psync_offset) {
                       "the primary replication offset (%lld)",
                       replicationGetReplicaName(c), psync_offset, server.primary_repl_offset);
         }
+
+        /* Disk catch-up: the history matched but the memory backlog can't serve
+         * this offset. Ask the suffix file, then a sibling, else FULL. */
+        int too_old = server.repl_backlog && psync_offset < server.repl_backlog->offset;
+        catchupDecision decision = catchupDecide(1, 0, too_old, too_old && replSuffixHasRange(psync_offset),
+                                                 too_old && catchupSiblingHasRange(psync_offset));
+        if (decision != CATCHUP_FULL) {
+            serverLog(LL_NOTICE, "Catch-up decision for replica %s: %s", replicationGetReplicaName(c),
+                      catchupDecisionName(decision));
+        }
+        /* On DISK the hold is kept: the suffix code removes it once the gap is
+         * sent, so the file is not trimmed under the reader. */
+        if (decision == CATCHUP_DISK && replSuffixServe(c, psync_offset) == C_OK) return C_OK;
+        if (decision == CATCHUP_REDIRECT && catchupRedirectServe(c, psync_offset) == C_OK) {
+            replHoldRemove(replicationGetReplicaName(c));
+            return C_OK;
+        }
         goto need_full_resync;
     }
 
@@ -957,6 +1142,8 @@ int primaryTryPartialResynchronization(client *c, long long psync_offset) {
     c->repl_data->repl_ack_time = server.unixtime;
     c->repl_data->repl_start_cmd_stream_on_ack = 0;
     listAddNodeTail(server.replicas, c);
+    /* Disk catch-up: served from memory, the hold is no longer needed. */
+    replHoldRemove(replicationGetReplicaName(c));
     /* We can't use the connection buffers since they are used to accumulate
      * new commands at this stage. But we are sure the socket send buffer is
      * empty so this write will never fail actually. */
@@ -989,7 +1176,11 @@ need_full_resync:
     /* We need a full resync for some reason... Note that we can't
      * reply to PSYNC right now if a full SYNC is needed. The reply
      * must include the primary offset at the time the RDB file we transfer
-     * is generated, so we need to delay the reply to that moment. */
+     * is generated, so we need to delay the reply to that moment.
+     *
+     * Disk catch-up: a full resync replaces the replica's whole dataset, so
+     * the bytes held for it will never be used. */
+    replHoldRemove(replicationGetReplicaName(c));
     return C_ERR;
 }
 
@@ -2100,6 +2291,7 @@ void updateReplicasWaitingBgsave(int bgsaveerr, int type) {
 void changeReplicationId(void) {
     getRandomHexChars(server.replid, CONFIG_RUN_ID_SIZE);
     server.replid[CONFIG_RUN_ID_SIZE] = '\0';
+    replHoldsPrune(); /* Holds on the old history may no longer be valid. */
 }
 
 /* Clear (invalidate) the secondary replication ID. This happens, for
@@ -2109,6 +2301,7 @@ void clearReplicationId2(void) {
     memset(server.replid2, '0', sizeof(server.replid));
     server.replid2[CONFIG_RUN_ID_SIZE] = '\0';
     server.second_replid_offset = -1;
+    replHoldsPrune(); /* Holds on the old secondary history are now invalid. */
 }
 
 /* Use the current replication ID / offset as secondary replication
@@ -5408,6 +5601,9 @@ void replicationCron(void) {
             }
         }
     }
+
+    /* Disk catch-up: expire old holds. */
+    replHoldsPrune();
 
     /* If this is a primary without attached replicas and there is a replication
      * backlog active, in order to reclaim memory we can free it after some
