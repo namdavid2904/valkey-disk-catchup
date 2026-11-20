@@ -140,7 +140,25 @@ int bg_unlink(const char *filename) {
  *
  * A hold goes away when the replica comes back and PSYNC is decided (MEMORY
  * or FULL), when it expires (catchup-hold-ttl), when its replication history
- * is no longer valid, or when the suffix file no longer covers its offset. */
+ * is no longer valid, when the suffix file no longer covers its offset, or
+ * when the backlog is freed. No backlog means no holds: a hold promises bytes
+ * from our history, and once the backlog is gone we can never serve them (the
+ * replication ID may stay the same, e.g. in replicationAttachToNewPrimary()).
+ *
+ * Hold identity (the "name"), shared with the suffix code (P2):
+ * - It is replicationGetReplicaName(c): the address from REPLCONF ip-address
+ *   if the replica sent one, else the socket peer IP, then ":" and the port
+ *   from REPLCONF listening-port. It must be computed while c->conn is open.
+ * - A replica that never sent REPLCONF listening-port (port 0, e.g.
+ *   valkey-cli --replica) gets no hold, since we could not match it on
+ *   reconnect. It simply behaves like stock Valkey.
+ * - One hold per name: a newer disconnect with the same name overwrites the
+ *   older hold (latest wins).
+ * - Two replicas sharing a name (same IP, e.g. behind NAT, and same listening
+ *   port) share one hold. The worst case is a FULL resync for one of them,
+ *   never wrong data: every PSYNC still runs its own history/offset checks.
+ * - P2 removes the hold with replHoldRemove(replicationGetReplicaName(c)) on
+ *   the reconnecting client once a DISK catch-up has been sent. */
 
 static listNode *replHoldFind(const char *name) {
     listIter li;
@@ -154,7 +172,8 @@ static listNode *replHoldFind(const char *name) {
     return NULL;
 }
 
-/* Create a hold, or refresh the existing one with the same name. */
+/* Create a hold, or overwrite the existing one with the same name (see "Hold
+ * identity" above). */
 void replHoldAdd(const char *name, const char *replid, long long ack_off) {
     if (!server.catchup_holds) return;
     listNode *ln = replHoldFind(name);
@@ -175,6 +194,7 @@ void replHoldAdd(const char *name, const char *replid, long long ack_off) {
  * full sync, rdb-only clients, and replicas that never ACKed or never told us
  * their listening port (we could not match them on reconnect). */
 void replHoldOnReplicaDisconnect(client *c) {
+    if (!server.repl_backlog) return; /* No backlog means no holds. */
     if (!c->repl_data || !c->flag.replica || c->flag.monitor || c->flag.repl_rdbonly) return;
     if (c->repl_data->repl_state != REPLICA_STATE_ONLINE) return;
     if (c->repl_data->repl_ack_off <= 0 || c->repl_data->replica_listening_port == 0) return;
@@ -326,6 +346,10 @@ void resizeReplicationBacklog(void) {
 
 void freeReplicationBacklog(void) {
     serverAssert(listLength(server.replicas) == 0);
+    /* Disk catch-up: holds point into this backlog's history, which we can no
+     * longer serve. Callers may keep the replication ID (e.g.
+     * replicationAttachToNewPrimary()), so ID-based pruning is not enough. */
+    replHoldsClear();
     if (server.repl_backlog == NULL) return;
 
     /* Decrease the start buffer node reference count. */

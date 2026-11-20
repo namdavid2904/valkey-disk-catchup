@@ -1072,7 +1072,7 @@ typedef struct replBacklog {
  * the in-memory backlog trims them. A hold is matched to the reconnecting
  * replica by name (ip:listening-port), since PSYNC only carries replid+offset. */
 typedef struct replHold {
-    char name[NET_HOST_PORT_STR_LEN];    /* ip:port, see replicationGetReplicaName(). */
+    char name[NET_HOST_PORT_STR_LEN];    /* ip:listening-port. See "Hold identity" in replication.c. */
     char replid[CONFIG_RUN_ID_SIZE + 1]; /* Replication history the replica was on. */
     long long ack_off;                   /* Last offset the replica acknowledged. It will
                                           * PSYNC from ack_off + 1 at the earliest. */
