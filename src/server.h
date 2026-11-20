@@ -1067,6 +1067,26 @@ typedef struct replBacklog {
                                   * byte in the replication backlog buffer.*/
 } replBacklog;
 
+/* Disk catch-up: a "hold" remembers a replica that disconnected while ONLINE,
+ * so the bytes it still needs can be kept (spilled to the suffix file) after
+ * the in-memory backlog trims them. A hold is matched to the reconnecting
+ * replica by name (ip:listening-port), since PSYNC only carries replid+offset. */
+typedef struct replHold {
+    char name[NET_HOST_PORT_STR_LEN];    /* ip:listening-port. See "Hold identity" in replication.c. */
+    char replid[CONFIG_RUN_ID_SIZE + 1]; /* Replication history the replica was on. */
+    long long ack_off;                   /* Last offset the replica acknowledged. It will
+                                          * PSYNC from ack_off + 1 at the earliest. */
+    time_t created;                      /* For catchup-hold-ttl expiry. */
+} replHold;
+
+/* Answer to a PSYNC once the existing history check has run. */
+typedef enum {
+    CATCHUP_MEMORY,   /* Offset is still in the in-memory backlog (stock +CONTINUE). */
+    CATCHUP_DISK,     /* Offset is in the on-disk suffix file. */
+    CATCHUP_REDIRECT, /* A sibling replica can serve the range. */
+    CATCHUP_FULL      /* Full resynchronization (stock fallback). */
+} catchupDecision;
+
 typedef struct replDataBuf {
     list *blocks; /* List of replDataBufBlock */
     size_t mem;   /* Total allocated memory including buffer metadata and list nodes */
@@ -2122,6 +2142,8 @@ struct valkeyServer {
                                                    gets released. */
     time_t repl_no_replicas_since;              /* We have no replicas since that time.
                                                  Only valid if server.replicas len is 0. */
+    list *catchup_holds;                        /* List of replHold, one per disconnected replica. */
+    time_t catchup_hold_ttl;                    /* Seconds a hold lives. 0 means never expire. */
     int repl_min_replicas_to_write;             /* Min number of replicas to write. */
     int repl_min_replicas_max_lag;              /* Max lag of <count> replicas to write. */
     int repl_good_replicas_count;               /* Number of replicas with lag <= max_lag. */
@@ -3235,6 +3257,20 @@ long long getPsyncInitialOffset(void);
 int replicationSetupReplicaForFullResync(client *replica, long long offset);
 void changeReplicationId(void);
 void clearReplicationId2(void);
+void replHoldAdd(const char *name, const char *replid, long long ack_off);
+void replHoldRemove(const char *name);
+void replHoldOnReplicaDisconnect(client *c);
+int replHoldIsValid(const replHold *h);
+void replHoldsPrune(void);
+void replHoldsClear(void);
+long long replHoldsMinOffset(void);
+void replHoldsSuffixBaseMoved(long long new_base);
+catchupDecision catchupDecide(int history_ok, int in_ring, int too_old, int in_suffix, int sibling_has);
+const char *catchupDecisionName(catchupDecision d);
+int replSuffixHasRange(long long offset);
+int replSuffixServe(client *c, long long offset);
+int catchupSiblingHasRange(long long offset);
+int catchupRedirectServe(client *c, long long offset);
 void createReplicationBacklog(void);
 void freeReplicationBacklog(void);
 void replicationCachePrimaryUsingMyself(void);

@@ -2197,6 +2197,9 @@ int freeClient(client *c) {
         else
             serverLog(LL_NOTICE, "Connection with replica %s lost.", replicationGetReplicaName(c));
     }
+    /* Disk catch-up: must run while c->conn is still open (for the replica's
+     * address) and before freeClientReplicationData() releases its backlog. */
+    replHoldOnReplicaDisconnect(c);
 
     /* Handle slot migration connection closed. */
     if (c->slot_migration_job) {
