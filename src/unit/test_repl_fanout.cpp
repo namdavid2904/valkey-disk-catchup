@@ -254,8 +254,19 @@ TEST_F(CatchupFanoutTest, BandwidthCapLimitsBytesPerStep) {
     catchupFanoutJoin(1, ID_A, 100, 0);
     catchupFanoutJoin(2, ID_A, 100, 0);
     catchupFanoutStep(1000000);
-    /* The cap counts disk bytes once, not once per replica. */
-    EXPECT_EQ(catchupStats.disk_bytes_read, 40000);
-    EXPECT_EQ(replicas[1].received, 40000);
-    EXPECT_EQ(replicas[2].received, 40000);
+    /* The cap counts every byte sent, so two replicas share it. */
+    EXPECT_EQ(catchupStats.bytes_sent, 40000);
+    EXPECT_EQ(catchupStats.disk_bytes_read, 20000);
+    EXPECT_EQ(replicas[1].received, 20000);
+    EXPECT_EQ(replicas[2].received, 20000);
+}
+
+TEST_F(CatchupFanoutTest, BandwidthCapNeverOvershootsWithUnevenSplit) {
+    suffix_end = 100 + 1024 * 1024;
+    allow_left = 40000;
+    for (uint64_t id = 1; id <= 3; id++) catchupFanoutJoin(id, ID_A, 100, 0);
+    catchupFanoutStep(1000000);
+    EXPECT_LE(catchupStats.bytes_sent, 40000);
+    EXPECT_EQ(catchupStats.bytes_sent, 3 * catchupStats.disk_bytes_read);
+    EXPECT_GT(catchupStats.bytes_sent, 40000 - 3);
 }

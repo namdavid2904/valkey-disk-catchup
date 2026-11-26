@@ -115,7 +115,7 @@ static int groupStep(catchupGroup *g) {
         if (g->n == 0) return 0;
         /* The group moves at its fastest waiter's pace; the slow ones queue up until dropped. */
         if (fastest >= CATCHUP_HIGH_WATER) return 1;
-        long long want = catchupOps.allow(CATCHUP_CHUNK);
+        long long want = catchupOps.allow((long long)CATCHUP_CHUNK * g->n) / g->n;
         if (want == 0) return 1;
         long long n = catchupOps.read(g->replid, g->cursor, buf, want);
         if (n < 0) {
