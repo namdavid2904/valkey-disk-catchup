@@ -10,6 +10,7 @@ DATASET_MB=${DATASET_MB:-256}
 BACKLOG=${BACKLOG:-10mb}
 VALUE=${VALUE:-1024}
 PRIMARY_ARGS=${PRIMARY_ARGS:-}
+RPS=${RPS:-0}
 
 work=$(mktemp -d)
 pids=""
@@ -35,11 +36,22 @@ start() {
     until cli "$port" ping >/dev/null 2>&1; do sleep 0.05; done
 }
 
-# Replica caught up: link up and its offset equals the primary's.
+# Replica caught up: link up and it has applied the primary's stream up to $2 (default: now).
 synced() {
-    want=$(info "$PORT" replication master_repl_offset)
+    want=${2:-$(info "$PORT" replication master_repl_offset)}
     [ "$(info "$1" replication master_link_status)" = up ] &&
-        [ "$(info "$1" replication slave_repl_offset)" = "$want" ]
+        [ "$(info "$1" replication slave_repl_offset)" -ge "$want" ]
+}
+
+# 1 if every replica's DEBUG DIGEST matches the primary's, else 0.
+digests_match() {
+    d=$(cli "$PORT" debug digest)
+    i=1
+    while [ "$i" -le "$1" ]; do
+        [ "$(cli $((PORT + i)) debug digest)" = "$d" ] || { echo 0; return; }
+        i=$((i + 1))
+    done
+    echo 1
 }
 
 setup() {
@@ -67,9 +79,12 @@ gap() {
     for p in $replica_pids; do kill -STOP "$p"; done
     cli "$PORT" client kill type replica >/dev/null
     off0=$(info "$PORT" replication master_repl_offset)
-    "$VALKEY_SRC/valkey-benchmark" -p "$PORT" -q -t set -d "$VALUE" -r 1000000 \
+    a0=$(now_ms)
+    "$VALKEY_SRC/valkey-benchmark" -p "$PORT" -q -t set -d "$VALUE" -r 1000000 --rps "$RPS" \
         -n $((gap_mb * 1024 * 1024 / VALUE)) >/dev/null
-    gap_bytes=$(($(info "$PORT" replication master_repl_offset) - off0))
+    away_ms=$(($(now_ms) - a0))
+    target=$(info "$PORT" replication master_repl_offset)
+    gap_bytes=$((target - off0))
     full0=$(info "$PORT" stats sync_full)
     part0=$(info "$PORT" stats sync_partial_ok)
     out0=$(info "$PORT" stats total_net_repl_output_bytes)
@@ -78,13 +93,19 @@ gap() {
     for p in $replica_pids; do kill -CONT "$p"; done
     i=1
     while [ "$i" -le "$n" ]; do
-        until synced $((PORT + i)); do sleep 0.02; done
+        until synced $((PORT + i)) "$target"; do sleep 0.02; done
         i=$((i + 1))
     done
     t1=$(now_ms)
     disk1=$(info "$PORT" replication catchup_disk_bytes_read)
-    echo "gap_bytes,replicas,backlog,dataset_mb,full_syncs,partial_syncs,repl_out_bytes,disk_bytes_read,recovery_ms"
-    echo "$gap_bytes,$n,$BACKLOG,$DATASET_MB,$(($(info "$PORT" stats sync_full) - full0)),$(($(info "$PORT" stats sync_partial_ok) - part0)),$(($(info "$PORT" stats total_net_repl_output_bytes) - out0)),${disk1:+$((disk1 - ${disk0:-0}))},$((t1 - t0))"
+    stats="$(($(info "$PORT" stats sync_full) - full0)),$(($(info "$PORT" stats sync_partial_ok) - part0)),$(($(info "$PORT" stats total_net_repl_output_bytes) - out0))"
+    i=1
+    while [ "$i" -le "$n" ]; do
+        until synced $((PORT + i)); do sleep 0.02; done
+        i=$((i + 1))
+    done
+    echo "gap_bytes,replicas,backlog,dataset_mb,rps,away_ms,full_syncs,partial_syncs,repl_out_bytes,disk_bytes_read,recovery_ms,digest_match"
+    echo "$gap_bytes,$n,$BACKLOG,$DATASET_MB,$RPS,$away_ms,$stats,${disk1:+$((disk1 - ${disk0:-0}))},$((t1 - t0)),$(digests_match "$n")"
 }
 
 steady() {
