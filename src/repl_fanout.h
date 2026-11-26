@@ -23,7 +23,7 @@ typedef struct catchupFanoutOps {
     void (*done)(uint64_t id, long long off);
     int (*write)(uint64_t id, const char *buf, long long len); /* -1 if the client is gone */
     long long (*pending)(uint64_t id);                         /* queued output bytes, -1 if gone */
-    void (*drop)(uint64_t id);                                 /* this replica alone falls back to FULL */
+    void (*drop)(uint64_t id);                                 /* close the replica; its next join is refused */
     long long (*allow)(long long want);                        /* bandwidth cap */
 } catchupFanoutOps;
 
@@ -42,7 +42,9 @@ typedef struct catchupFanoutStats {
 extern catchupFanoutOps catchupOps;
 extern catchupFanoutStats catchupStats;
 
-int catchupFanoutJoin(uint64_t id, const char *replid, long long start, long long now_us);
+/* name is replicationGetReplicaName(c). C_ERR means do a full sync: no suffix reader yet, or
+ * this replica was dropped from its last group. */
+int catchupFanoutJoin(uint64_t id, const char *name, const char *replid, long long start, long long now_us);
 void catchupFanoutStep(long long now_us);
 void catchupFanoutReset(void);
 unsigned long catchupFanoutWaiting(void);

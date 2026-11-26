@@ -7,6 +7,7 @@
 #include "generated_wrappers.hpp"
 
 #include <map>
+#include <string>
 
 extern "C" {
 #include "repl_fanout.h"
@@ -56,6 +57,10 @@ TEST(CatchupBucketTest, LoweringRateClampsSavedTokens) {
     catchupBucket b = {};
     catchupBucketTake(&b, 100 * MB, 0, 1000000);
     EXPECT_EQ(catchupBucketTake(&b, 1 * MB, 64 * MB, 1000000), 1 * MB);
+}
+
+static std::string nm(uint64_t id) {
+    return "10.0.0.1:" + std::to_string(6000 + id);
 }
 
 static const char *ID_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -142,13 +147,13 @@ class CatchupFanoutTest : public ::testing::Test {
 
 TEST_F(CatchupFanoutTest, NoReaderMeansNoDiskPath) {
     catchupOps.read = nullptr;
-    EXPECT_EQ(catchupFanoutJoin(1, ID_A, 100, 0), C_ERR);
+    EXPECT_EQ(catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0), C_ERR);
     EXPECT_EQ(catchupFanoutWaiting(), 0u);
 }
 
 TEST_F(CatchupFanoutTest, ThreeReplicasSameGapReadTheDiskOnce) {
     suffix_end = 100 + 5 * 1024 * 1024;
-    for (uint64_t id = 1; id <= 3; id++) ASSERT_EQ(catchupFanoutJoin(id, ID_A, 100, id * 1000), C_OK);
+    for (uint64_t id = 1; id <= 3; id++) ASSERT_EQ(catchupFanoutJoin(id, nm(id).c_str(), ID_A, 100, id * 1000), C_OK);
     runToEnd(2000000);
     EXPECT_EQ(catchupStats.disk_bytes_read, 5 * 1024 * 1024);
     EXPECT_EQ(catchupStats.bytes_sent, 15 * 1024 * 1024);
@@ -162,7 +167,7 @@ TEST_F(CatchupFanoutTest, ThreeReplicasSameGapReadTheDiskOnce) {
 
 TEST_F(CatchupFanoutTest, NothingIsSentBeforeTheDelay) {
     suffix_end = 200;
-    catchupFanoutJoin(1, ID_A, 100, 0);
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
     catchupFanoutStep(999999);
     EXPECT_EQ(read_calls, 0);
     catchupFanoutStep(1000000);
@@ -172,16 +177,16 @@ TEST_F(CatchupFanoutTest, NothingIsSentBeforeTheDelay) {
 TEST_F(CatchupFanoutTest, ZeroDelayStartsOnTheNextStep) {
     server.repl_catchup_delay_ms = 0;
     suffix_end = 200;
-    catchupFanoutJoin(1, ID_A, 100, 0);
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
     catchupFanoutStep(0);
     EXPECT_EQ(replicas[1].done_at, 200);
 }
 
 TEST_F(CatchupFanoutTest, DifferentStartOrReplidGetsItsOwnRead) {
     suffix_end = 10000;
-    catchupFanoutJoin(1, ID_A, 100, 0);
-    catchupFanoutJoin(2, ID_A, 200, 0);
-    catchupFanoutJoin(3, ID_B, 100, 0);
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
+    catchupFanoutJoin(2, nm(2).c_str(), ID_A, 200, 0);
+    catchupFanoutJoin(3, nm(3).c_str(), ID_B, 100, 0);
     runToEnd(1000000);
     EXPECT_EQ(catchupStats.groups, 3);
     EXPECT_EQ(catchupStats.waiters_coalesced, 0);
@@ -190,9 +195,9 @@ TEST_F(CatchupFanoutTest, DifferentStartOrReplidGetsItsOwnRead) {
 
 TEST_F(CatchupFanoutTest, LateArrivalAfterSendStartsGetsANewGroup) {
     suffix_end = 100 + 4 * 1024 * 1024;
-    catchupFanoutJoin(1, ID_A, 100, 0);
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
     catchupFanoutStep(1000000);
-    catchupFanoutJoin(2, ID_A, 100, 1000000);
+    catchupFanoutJoin(2, nm(2).c_str(), ID_A, 100, 1000000);
     runToEnd(3000000);
     EXPECT_EQ(catchupStats.groups, 2);
     EXPECT_EQ(replicas[2].received, 4 * 1024 * 1024);
@@ -200,8 +205,8 @@ TEST_F(CatchupFanoutTest, LateArrivalAfterSendStartsGetsANewGroup) {
 
 TEST_F(CatchupFanoutTest, SlowReplicaIsDroppedAloneAndTheOthersFinish) {
     suffix_end = 100 + 80 * 1024 * 1024;
-    catchupFanoutJoin(1, ID_A, 100, 0);
-    catchupFanoutJoin(2, ID_A, 100, 0);
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
+    catchupFanoutJoin(2, nm(2).c_str(), ID_A, 100, 0);
     replicas[2].drains = false;
     runToEnd(1000000);
     EXPECT_TRUE(replicas[2].dropped);
@@ -212,10 +217,43 @@ TEST_F(CatchupFanoutTest, SlowReplicaIsDroppedAloneAndTheOthersFinish) {
     EXPECT_EQ(catchupStats.disk_bytes_read, 80 * 1024 * 1024);
 }
 
+TEST_F(CatchupFanoutTest, DroppedReplicaGoesFullOnItsNextTry) {
+    suffix_end = 100 + 80 * 1024 * 1024;
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
+    catchupFanoutJoin(2, nm(2).c_str(), ID_A, 100, 0);
+    replicas[2].drains = false;
+    runToEnd(1000000);
+    ASSERT_TRUE(replicas[2].dropped);
+    /* Same replica reconnects under a new client id. */
+    EXPECT_EQ(catchupFanoutJoin(7, nm(2).c_str(), ID_A, 100, 2000000), C_ERR);
+    EXPECT_EQ(catchupFanoutWaiting(), 0u);
+    EXPECT_EQ(catchupFanoutJoin(8, nm(2).c_str(), ID_A, 100, 3000000), C_OK);
+    EXPECT_EQ(catchupFanoutJoin(9, nm(1).c_str(), ID_A, 100, 3000000), C_OK);
+}
+
+TEST_F(CatchupFanoutTest, ReadErrorSendsEveryWaiterFullOnRetry) {
+    suffix_end = 10000;
+    read_fails = true;
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
+    catchupFanoutJoin(2, nm(2).c_str(), ID_A, 100, 0);
+    catchupFanoutStep(1000000);
+    read_fails = false;
+    EXPECT_EQ(catchupFanoutJoin(3, nm(1).c_str(), ID_A, 100, 2000000), C_ERR);
+    EXPECT_EQ(catchupFanoutJoin(4, nm(2).c_str(), ID_A, 100, 2000000), C_ERR);
+}
+
+TEST_F(CatchupFanoutTest, GoneClientIsNotSentFull) {
+    suffix_end = 100 + 1024 * 1024;
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
+    replicas[1].gone = true;
+    runToEnd(1000000);
+    EXPECT_EQ(catchupFanoutJoin(2, nm(1).c_str(), ID_A, 100, 2000000), C_OK);
+}
+
 TEST_F(CatchupFanoutTest, ALoneSlowReplicaIsNotDropped) {
     /* With nobody faster, slow is just the link speed; the group waits for it. */
     suffix_end = 100 + 2 * 1024 * 1024;
-    catchupFanoutJoin(1, ID_A, 100, 0);
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
     replicas[1].drains = false;
     for (int i = 0; i < 50; i++) catchupFanoutStep(1000000);
     EXPECT_FALSE(replicas[1].dropped);
@@ -227,8 +265,8 @@ TEST_F(CatchupFanoutTest, ALoneSlowReplicaIsNotDropped) {
 
 TEST_F(CatchupFanoutTest, GoneClientIsForgottenWithoutAFallback) {
     suffix_end = 100 + 1024 * 1024;
-    catchupFanoutJoin(1, ID_A, 100, 0);
-    catchupFanoutJoin(2, ID_A, 100, 0);
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
+    catchupFanoutJoin(2, nm(2).c_str(), ID_A, 100, 0);
     replicas[2].gone = true;
     runToEnd(1000000);
     EXPECT_EQ(replicas[1].done_at, suffix_end);
@@ -239,8 +277,8 @@ TEST_F(CatchupFanoutTest, GoneClientIsForgottenWithoutAFallback) {
 TEST_F(CatchupFanoutTest, ReadErrorDropsTheWholeGroup) {
     suffix_end = 10000;
     read_fails = true;
-    catchupFanoutJoin(1, ID_A, 100, 0);
-    catchupFanoutJoin(2, ID_A, 100, 0);
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
+    catchupFanoutJoin(2, nm(2).c_str(), ID_A, 100, 0);
     catchupFanoutStep(1000000);
     EXPECT_TRUE(replicas[1].dropped);
     EXPECT_TRUE(replicas[2].dropped);
@@ -251,8 +289,8 @@ TEST_F(CatchupFanoutTest, ReadErrorDropsTheWholeGroup) {
 TEST_F(CatchupFanoutTest, BandwidthCapLimitsBytesPerStep) {
     suffix_end = 100 + 1024 * 1024;
     allow_left = 40000;
-    catchupFanoutJoin(1, ID_A, 100, 0);
-    catchupFanoutJoin(2, ID_A, 100, 0);
+    catchupFanoutJoin(1, nm(1).c_str(), ID_A, 100, 0);
+    catchupFanoutJoin(2, nm(2).c_str(), ID_A, 100, 0);
     catchupFanoutStep(1000000);
     /* The cap counts every byte sent, so two replicas share it. */
     EXPECT_EQ(catchupStats.bytes_sent, 40000);
@@ -264,7 +302,7 @@ TEST_F(CatchupFanoutTest, BandwidthCapLimitsBytesPerStep) {
 TEST_F(CatchupFanoutTest, BandwidthCapNeverOvershootsWithUnevenSplit) {
     suffix_end = 100 + 1024 * 1024;
     allow_left = 40000;
-    for (uint64_t id = 1; id <= 3; id++) catchupFanoutJoin(id, ID_A, 100, 0);
+    for (uint64_t id = 1; id <= 3; id++) catchupFanoutJoin(id, nm(id).c_str(), ID_A, 100, 0);
     catchupFanoutStep(1000000);
     EXPECT_LE(catchupStats.bytes_sent, 40000);
     EXPECT_EQ(catchupStats.bytes_sent, 3 * catchupStats.disk_bytes_read);

@@ -26,6 +26,7 @@ typedef struct catchupGroup {
     long long ready_us;
     int started;
     uint64_t *ids;
+    sds *names;
     int n;
 } catchupGroup;
 
@@ -42,7 +43,6 @@ static long long serverPending(uint64_t id) {
     return getClientOutputBufferMemoryUsage(c);
 }
 
-/* The suffix code must also make this replica's next PSYNC go FULL, or it rejoins a group. */
 static void serverDrop(uint64_t id) {
     client *c = lookupClientByID(id);
     if (c) freeClientAsync(c);
@@ -51,14 +51,35 @@ static void serverDrop(uint64_t id) {
 catchupFanoutOps catchupOps = {NULL, NULL, serverWrite, serverPending, serverDrop, catchupAllowance};
 catchupFanoutStats catchupStats;
 static list *groups;
+static list *dropped;
 
-static void groupFree(void *g) {
-    zfree(((catchupGroup *)g)->ids);
+#define CATCHUP_DROPPED_MAX 128
+
+static void groupFree(void *p) {
+    catchupGroup *g = p;
+    for (int i = 0; i < g->n; i++) sdsfree(g->names[i]);
+    zfree(g->ids);
+    zfree(g->names);
     zfree(g);
 }
 
-int catchupFanoutJoin(uint64_t id, const char *replid, long long start, long long now_us) {
+static int takeDropped(const char *name) {
+    if (!dropped) return 0;
+    listIter li;
+    listNode *ln;
+    listRewind(dropped, &li);
+    while ((ln = listNext(&li))) {
+        if (!strcmp(listNodeValue(ln), name)) {
+            listDelNode(dropped, ln);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int catchupFanoutJoin(uint64_t id, const char *name, const char *replid, long long start, long long now_us) {
     if (!catchupOps.read) return C_ERR;
+    if (takeDropped(name)) return C_ERR;
     if (!groups) {
         groups = listCreate();
         listSetFreeMethod(groups, groupFree);
@@ -83,12 +104,30 @@ int catchupFanoutJoin(uint64_t id, const char *replid, long long start, long lon
         listAddNodeTail(groups, g);
     }
     g->ids = zrealloc(g->ids, sizeof(uint64_t) * (g->n + 1));
-    g->ids[g->n++] = id;
+    g->names = zrealloc(g->names, sizeof(sds) * (g->n + 1));
+    g->ids[g->n] = id;
+    g->names[g->n++] = sdsnew(name);
     return C_OK;
 }
 
 static void removeWaiter(catchupGroup *g, int i) {
-    g->ids[i] = g->ids[--g->n];
+    sdsfree(g->names[i]);
+    g->n--;
+    g->ids[i] = g->ids[g->n];
+    g->names[i] = g->names[g->n];
+}
+
+/* Drops the waiter to FULL and remembers its name, so its reconnect is refused a new group. */
+static void dropWaiter(catchupGroup *g, int i) {
+    if (!dropped) {
+        dropped = listCreate();
+        listSetFreeMethod(dropped, sdsfreeVoid);
+    }
+    if (listLength(dropped) >= CATCHUP_DROPPED_MAX) listDelNode(dropped, listFirst(dropped));
+    listAddNodeTail(dropped, sdsdup(g->names[i]));
+    catchupOps.drop(g->ids[i]);
+    catchupStats.fallbacks++;
+    removeWaiter(g, i);
 }
 
 /* Sends at most CATCHUP_HIGH_WATER bytes. Returns 0 once the group is finished. */
@@ -104,9 +143,7 @@ static int groupStep(catchupGroup *g) {
                 continue;
             }
             if (p > CATCHUP_SLOW_BYTES) {
-                catchupOps.drop(g->ids[i]);
-                catchupStats.fallbacks++;
-                removeWaiter(g, i);
+                dropWaiter(g, i);
                 continue;
             }
             if (p < fastest) fastest = p;
@@ -119,8 +156,7 @@ static int groupStep(catchupGroup *g) {
         if (want == 0) return 1;
         long long n = catchupOps.read(g->replid, g->cursor, buf, want);
         if (n < 0) {
-            for (int i = 0; i < g->n; i++) catchupOps.drop(g->ids[i]);
-            catchupStats.fallbacks += g->n;
+            while (g->n) dropWaiter(g, 0);
             return 0;
         }
         if (n == 0) {
@@ -160,6 +196,7 @@ void catchupFanoutStep(long long now_us) {
 
 void catchupFanoutReset(void) {
     if (groups) listEmpty(groups);
+    if (dropped) listEmpty(dropped);
     memset(&catchupStats, 0, sizeof(catchupStats));
 }
 
