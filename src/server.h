@@ -2130,6 +2130,7 @@ struct valkeyServer {
                                                  * see REPL_DISKLESS_LOAD_* enum */
     int repl_diskless_sync_delay;               /* Delay to start a diskless repl BGSAVE. */
     int repl_catchup_max_mbps;                  /* Disk catch-up bandwidth cap in MB/s, 0 = unlimited. */
+    int repl_catchup_delay_ms;                  /* Wait for more replicas to share one catch-up read. */
     int repl_diskless_sync_max_replicas;        /* Max replicas for diskless repl BGSAVE
                                                  * delay (start sooner if they all connect). */
     int dual_channel_replication;               /* Config used to determine if the replica should
