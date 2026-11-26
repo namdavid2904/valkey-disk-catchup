@@ -43,7 +43,8 @@ extern catchupFanoutOps catchupOps;
 extern catchupFanoutStats catchupStats;
 
 /* name is replicationGetReplicaName(c). C_ERR means do a full sync: no suffix reader yet, or
- * this replica was dropped from its last group. */
+ * this replica was dropped from its last group. Call it before writing +CONTINUE: C_ERR has sent
+ * nothing, so the caller can still answer FULLRESYNC. */
 int catchupFanoutJoin(uint64_t id, const char *name, const char *replid, long long start, long long now_us);
 void catchupFanoutStep(long long now_us);
 void catchupFanoutReset(void);

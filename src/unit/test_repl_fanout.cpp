@@ -227,6 +227,7 @@ TEST_F(CatchupFanoutTest, DroppedReplicaGoesFullOnItsNextTry) {
     /* Same replica reconnects under a new client id. */
     EXPECT_EQ(catchupFanoutJoin(7, nm(2).c_str(), ID_A, 100, 2000000), C_ERR);
     EXPECT_EQ(catchupFanoutWaiting(), 0u);
+    EXPECT_EQ(replicas[7].received, 0);
     EXPECT_EQ(catchupFanoutJoin(8, nm(2).c_str(), ID_A, 100, 3000000), C_OK);
     EXPECT_EQ(catchupFanoutJoin(9, nm(1).c_str(), ID_A, 100, 3000000), C_OK);
 }
