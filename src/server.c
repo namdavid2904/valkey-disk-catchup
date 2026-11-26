@@ -6625,6 +6625,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 replica_id++;
             }
         }
+        info = sdscatprintf(info,
+                            FMTARGS(
+                                "catchup_groups_waiting:%lu\r\n", catchupFanoutWaiting(),
+                                "catchup_disk_bytes_read:%lld\r\n", catchupStats.disk_bytes_read,
+                                "catchup_bytes_sent:%lld\r\n", catchupStats.bytes_sent,
+                                "catchup_shared_reads:%lld\r\n", catchupStats.groups,
+                                "catchup_waiters_coalesced:%lld\r\n", catchupStats.waiters_coalesced,
+                                "catchup_fallbacks:%lld\r\n", catchupStats.fallbacks));
         info = sdscatprintf(
             info,
             FMTARGS(
@@ -6638,14 +6646,6 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_backlog_size:%lld\r\n", server.repl_backlog_size,
                 "repl_backlog_first_byte_offset:%lld\r\n", server.repl_backlog ? server.repl_backlog->offset : 0,
                 "repl_backlog_histlen:%lld\r\n", server.repl_backlog ? server.repl_backlog->histlen : 0));
-        info = sdscatprintf(info,
-                            FMTARGS(
-                                "catchup_groups_waiting:%lu\r\n", catchupFanoutWaiting(),
-                                "catchup_disk_bytes_read:%lld\r\n", catchupStats.disk_bytes_read,
-                                "catchup_bytes_sent:%lld\r\n", catchupStats.bytes_sent,
-                                "catchup_shared_reads:%lld\r\n", catchupStats.groups,
-                                "catchup_waiters_coalesced:%lld\r\n", catchupStats.waiters_coalesced,
-                                "catchup_fallbacks:%lld\r\n", catchupStats.fallbacks));
     }
 
     /* CPU */
