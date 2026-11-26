@@ -32,6 +32,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "server.h"
+#include "repl_fanout.h"
 #include "connection.h"
 #include "monotonic.h"
 #include "cluster.h"
@@ -1935,6 +1936,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
          * wake them up ASAP. */
         if (listLength(server.clients_waiting_acks) && prev_fsynced_reploff != server.fsynced_reploff) dont_sleep = 1;
     }
+
+    if (catchupFanoutWaiting()) catchupFanoutStep(ustime());
 
     /* Handle writes with pending output buffers. */
     int client_writes = handleClientsWithPendingWrites();
